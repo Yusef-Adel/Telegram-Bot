@@ -1,3 +1,4 @@
+import requests
 import asyncio
 import os
 import logging
@@ -25,9 +26,9 @@ os.makedirs("logs", exist_ok=True)
 # Create a RotatingFileHandler
 handler = RotatingFileHandler(
     os.path.join("logs", "telegram_monitor_text_only.log"),
-    maxBytes=5*1024*1024,  # 5 MB
-    backupCount=5,         # Keep up to 5 backup log files
-    encoding='utf-8'       # Handle Unicode characters
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=5,  # Keep up to 5 backup log files
+    encoding='utf-8'  # Handle Unicode characters
 )
 
 # Create a logging format
@@ -50,7 +51,7 @@ load_dotenv()
 # Retrieve API credentials and other configurations from environment variables
 API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
-BOT_TOKEN = os.getenv('BOT_TOKEN')          # The bot's API token
+BOT_TOKEN = os.getenv('BOT_TOKEN')  # The bot's API token
 TARGET_CHANNELS = os.getenv('TARGET_CHANNELS')  # Comma-separated list of channels
 NOTIFY_USER_IDS = os.getenv('NOTIFY_USER_IDS')  # Comma-separated list of user IDs
 
@@ -123,7 +124,39 @@ def escape_html(text):
     return html.escape(text)
 
 # -----------------------------
-# 9. Define the Main Asynchronous Function
+# 9. Gold API Fetch Function
+# -----------------------------
+def fetch_xauusd_price():
+    """
+    Fetches the live price of XAUUSD (gold vs USD) using the Gold API.
+    """
+    api_key = os.getenv('GOLD_API_KEY')
+    url = "https://www.goldapi.io/api/XAU/USD"
+    
+    headers = {
+        "x-access-token": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+
+        # Parse the JSON response
+        data = response.json()
+        price = data.get("price")
+        if price is not None:
+            logger.info(f"💰 Current XAUUSD Price: {price}")
+            return price
+        else:
+            logger.error("❌ Failed to retrieve price from the Gold API response.")
+            return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Error fetching XAUUSD price: {e}")
+        return None
+
+# -----------------------------
+# 10. Define the Main Asynchronous Function
 # -----------------------------
 async def main():
     # Start the user client
@@ -167,6 +200,11 @@ async def main():
         # Escape HTML characters in the message text to prevent formatting issues
         escaped_message_text = escape_html(message_text)
 
+        # Fetch the latest XAUUSD price
+        price = fetch_xauusd_price()
+        if price:
+            escaped_message_text += f"\n\n💰 Current XAUUSD Price: {price} USD"
+
         # Prepare the forwarded message with channel context
         channel_name = get_channel_display_name(event)
         forward_text = f"🔔 **New Call in {channel_name}:**\n\n{escaped_message_text}"
@@ -176,7 +214,7 @@ async def main():
             forward_text += "\n*This message was forwarded from another chat.*"
 
         # -----------------------------
-        # 10. Send the Forwarded Message via Bot
+        # Send the Forwarded Message via Bot
         # -----------------------------
         for user_id in NOTIFY_USER_IDS:
             try:
@@ -209,8 +247,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("\n🔒 Bot stopped by user.")
     except Exception as e:
-        # Encode the error message to handle Unicode characters
-        try:
-            logger.error(f"\n❌ An unexpected error occurred: {e}")
-        except UnicodeEncodeError:
-            logger.error("\n❌ An unexpected error occurred: [Unicode characters not supported]")
+        logger.error(f"\n❌ An unexpected error occurred: {e}")
