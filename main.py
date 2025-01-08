@@ -1,9 +1,7 @@
 import requests
 import asyncio
 import os
-import logging
-from logging.handlers import RotatingFileHandler
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import (
     SessionPasswordNeededError,
     RPCError,
@@ -13,6 +11,8 @@ from telethon.errors import (
 from dotenv import load_dotenv
 import re
 import html  # For escaping HTML characters
+import logging
+from logging.handlers import RotatingFileHandler
 
 # -----------------------------
 # 1. Configure Logging with Log Rotation
@@ -178,7 +178,30 @@ async def main():
 
     logger.info("✅ Bot is running and monitoring **call** messages in the channels...")
 
-    # Define the event handler for new messages in target channels
+    # -----------------------------
+    # Inline Button Callback Handler
+    # -----------------------------
+    @bot_client.on(events.CallbackQuery)
+    async def callback_query_handler(event):
+        data = event.data.decode('utf-8')
+        
+        if data == "get_xauusd_price":
+            price = fetch_xauusd_price()
+            if price is not None:
+                # Respond with an alert message containing the price
+                await event.answer(
+                    f"💰 Current XAUUSD Price: {price} USD",
+                    alert=True
+                )
+            else:
+                await event.answer(
+                    "❌ Error fetching XAUUSD price. Please try again later.",
+                    alert=True
+                )
+
+    # -----------------------------
+    # Event Handler: Forward Matching Messages
+    # -----------------------------
     @user_client.on(events.NewMessage(chats=TARGET_CHANNELS))
     async def handler(event):
         message_text = event.message.message or ""
@@ -190,7 +213,6 @@ async def main():
 
         # Check if the message matches the "call" pattern
         if not CALL_PATTERN.match(message_text):
-            # Message does not match the "call" criteria; skip forwarding
             logger.info(f"📄 Skipped forwarding a non-call message from {get_channel_display_name(event)}.")
             return
 
@@ -200,11 +222,6 @@ async def main():
         # Escape HTML characters in the message text to prevent formatting issues
         escaped_message_text = escape_html(message_text)
 
-        # Fetch the latest XAUUSD price
-        price = fetch_xauusd_price()
-        if price:
-            escaped_message_text += f"\n\n💰 Current XAUUSD Price: {price} USD"
-
         # Prepare the forwarded message with channel context
         channel_name = get_channel_display_name(event)
         forward_text = f"🔔 **New Call in {channel_name}:**\n\n{escaped_message_text}"
@@ -213,14 +230,18 @@ async def main():
         if is_forwarded:
             forward_text += "\n*This message was forwarded from another chat.*"
 
+        # Inline button to fetch the price on demand
+        buttons = [[Button.inline("Get XAUUSD Price", b"get_xauusd_price")]]
+
         # -----------------------------
-        # Send the Forwarded Message via Bot
+        # Send the Forwarded Message via Bot (with button)
         # -----------------------------
         for user_id in NOTIFY_USER_IDS:
             try:
                 await bot_client.send_message(
                     entity=user_id,
-                    message=forward_text
+                    message=forward_text,
+                    buttons=buttons
                 )
                 logger.info(f"📩 Forwarded call to user ID {user_id}: {message_text}")
             except UsernameNotOccupiedError:
