@@ -47,10 +47,10 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 TARGET_CHANNELS = os.getenv('TARGET_CHANNELS')  # Comma-separated list of channels
 
 if not all([API_ID, API_HASH, BOT_TOKEN, TARGET_CHANNELS]):
-    logger.error("❌ One or more required environment variables are missing. Please check your .env file.")
+    logger.error("❌ One or more required environment variables are missing. Check your .env file.")
     exit(1)
 
-TARGET_CHANNELS = [channel.strip() for channel in TARGET_CHANNELS.split(',') if channel.strip()]
+TARGET_CHANNELS = [ch.strip() for ch in TARGET_CHANNELS.split(',') if ch.strip()]
 
 # -----------------------------
 # 3. SQLite Database Setup
@@ -59,12 +59,11 @@ DB_FILE = "subscribers.db"
 
 def init_db():
     """
-    Creates the necessary table (if it doesn't exist) 
+    Creates the necessary table if it doesn't exist 
     to store subscribed user IDs.
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # We'll store user IDs as integers, primary key to avoid duplicates
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS subscribed_users (
             user_id INTEGER PRIMARY KEY
@@ -75,19 +74,28 @@ def init_db():
 
 def add_subscribed_user(user_id):
     """
-    Inserts the user ID into the subscribed_users table 
-    (if it's not already there).
+    Inserts the user ID into the subscribed_users table (if not already present).
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # INSERT OR IGNORE will not fail if there's a duplicate
+    # INSERT OR IGNORE prevents duplicate errors
     cursor.execute("INSERT OR IGNORE INTO subscribed_users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def remove_subscribed_user(user_id):
+    """
+    Removes the user ID from the subscribed_users table.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM subscribed_users WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
 def is_user_subscribed(user_id):
     """
-    Checks if a user ID is already in the subscribed_users table.
+    Checks if a user is already subscribed.
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -98,14 +106,13 @@ def is_user_subscribed(user_id):
 
 def get_all_subscribed_users():
     """
-    Retrieves all user IDs from the subscribed_users table.
+    Retrieves all subscribed user IDs from the database.
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM subscribed_users")
     rows = cursor.fetchall()
     conn.close()
-    # Return as a list of integers
     return [row[0] for row in rows]
 
 # Initialize the SQLite database/table
@@ -114,7 +121,7 @@ init_db()
 # -----------------------------
 # 4. Define "Call" Message Filtering Criteria
 # -----------------------------
-# Regex pattern: starts with XAUUSD and contains BUY or Sell (case-insensitive)
+# Regex: starts with XAUUSD and contains BUY or Sell (case-insensitive)
 CALL_PATTERN = re.compile(r'^XAUUSD.*\b(BUY|Sell)\b', re.IGNORECASE)
 
 # -----------------------------
@@ -158,7 +165,6 @@ def fetch_xauusd_price():
     """
     api_key = os.getenv('GOLD_API_KEY')
     url = "https://www.goldapi.io/api/XAU/USD"
-    
     headers = {
         "x-access-token": api_key,
         "Content-Type": "application/json"
@@ -181,14 +187,14 @@ def fetch_xauusd_price():
         return None
 
 # -----------------------------
-# 7. Main Asynchronous Function
+# 7. Main Async Function
 # -----------------------------
 async def main():
     # Start the user client
     try:
         await user_client.start()
     except SessionPasswordNeededError:
-        logger.error("❌ Two-Step Verification is enabled for the user account. Please disable it or handle it in the script.")
+        logger.error("❌ Two-Step Verification is enabled for the user account.")
         return
     except RPCError as e:
         logger.error(f"❌ RPC Error during user client start: {e}")
@@ -201,17 +207,13 @@ async def main():
         logger.error(f"❌ RPC Error during bot client start: {e}")
         return
 
-    logger.info("✅ Bot is running and monitoring **call** messages in the channels...")
+    logger.info("✅ Bot is running and monitoring **call** messages...")
 
     # -----------------------------
     # Bot Command Handler: /start
     # -----------------------------
     @bot_client.on(events.NewMessage(pattern=r'^/start$'))
     async def start_handler(event):
-        """
-        When a user sends /start, add them to the subscribed list and
-        confirm subscription.
-        """
         user_id = event.sender_id
         if not is_user_subscribed(user_id):
             add_subscribed_user(user_id)
@@ -226,7 +228,8 @@ async def main():
     @bot_client.on(events.CallbackQuery)
     async def callback_query_handler(event):
         data = event.data.decode('utf-8')
-        
+
+        # 1) "Get XAUUSD Price"
         if data == "get_xauusd_price":
             price = fetch_xauusd_price()
             if price is not None:
@@ -239,6 +242,16 @@ async def main():
                     "❌ Error fetching XAUUSD price. Please try again later.",
                     alert=True
                 )
+        
+        # 2) "Unsubscribe"
+        elif data == "unsubscribe_me":
+            user_id = event.sender_id
+            if is_user_subscribed(user_id):
+                remove_subscribed_user(user_id)
+                await event.answer("You have been unsubscribed from gold signals.", alert=True)
+                logger.info(f"User {user_id} unsubscribed via inline button.")
+            else:
+                await event.answer("You are not currently subscribed.", alert=True)
 
     # -----------------------------
     # User Client: Forward Matching Messages
@@ -246,34 +259,31 @@ async def main():
     @user_client.on(events.NewMessage(chats=TARGET_CHANNELS))
     async def handler(event):
         message_text = event.message.message or ""
-
-        # Check for empty or whitespace-only messages
         if not message_text.strip():
             logger.info(f"📄 Skipped forwarding an empty or non-text message from {get_channel_display_name(event)}.")
             return
 
-        # Check if the message matches the "call" pattern
         if not CALL_PATTERN.match(message_text):
             logger.info(f"📄 Skipped forwarding a non-call message from {get_channel_display_name(event)}.")
             return
 
-        # Check if the message was forwarded in the channel
         is_forwarded = event.message.fwd_from is not None
-
-        # Escape HTML characters in the message text
         escaped_message_text = escape_html(message_text)
-
-        # Prepare the forwarded message with channel context
         channel_name = get_channel_display_name(event)
         forward_text = f"🔔 **New Call in {channel_name}:**\n\n{escaped_message_text}"
-
         if is_forwarded:
             forward_text += "\n*This message was forwarded from another chat.*"
 
-        # Inline button to fetch the price on demand
-        buttons = [[Button.inline("Get XAUUSD Price", b"get_xauusd_price")]]
+        # Two inline buttons:
+        # 1) Get the XAUUSD price.
+        # 2) Unsubscribe from the bot.
+        buttons = [
+            [
+                Button.inline("Get XAUUSD Price", b"get_xauusd_price"),
+                Button.inline("Unsubscribe", b"unsubscribe_me")
+            ]
+        ]
 
-        # Get all subscribed users from the database
         subscribed_users = get_all_subscribed_users()
         if not subscribed_users:
             logger.info("No subscribed users to forward this call to.")
