@@ -1,6 +1,7 @@
 import requests
 import asyncio
 import os
+import sqlite3
 from telethon import Button, TelegramClient, events
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -20,25 +21,17 @@ from logging.handlers import RotatingFileHandler
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Change to DEBUG for more detailed logs
 
-# Ensure the logs directory exists
 os.makedirs("logs", exist_ok=True)
-
-# Create a RotatingFileHandler
 handler = RotatingFileHandler(
     os.path.join("logs", "telegram_monitor_text_only.log"),
     maxBytes=5 * 1024 * 1024,  # 5 MB
-    backupCount=5,  # Keep up to 5 backup log files
-    encoding='utf-8'  # Handle Unicode characters
+    backupCount=5,
+    encoding='utf-8'
 )
-
-# Create a logging format
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
-
-# Add the handler to the logger
 logger.addHandler(handler)
 
-# Also add StreamHandler to output logs to console
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
@@ -48,55 +41,94 @@ logger.addHandler(stream_handler)
 # -----------------------------
 load_dotenv()
 
-# Retrieve API credentials and other configurations from environment variables
 API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
-BOT_TOKEN = os.getenv('BOT_TOKEN')  # The bot's API token
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 TARGET_CHANNELS = os.getenv('TARGET_CHANNELS')  # Comma-separated list of channels
-NOTIFY_USER_IDS = os.getenv('NOTIFY_USER_IDS')  # Comma-separated list of user IDs
 
-# -----------------------------
-# 3. Validate Environment Variables
-# -----------------------------
-if not all([API_ID, API_HASH, BOT_TOKEN, TARGET_CHANNELS, NOTIFY_USER_IDS]):
+if not all([API_ID, API_HASH, BOT_TOKEN, TARGET_CHANNELS]):
     logger.error("❌ One or more required environment variables are missing. Please check your .env file.")
     exit(1)
 
-# -----------------------------
-# 4. Parse Target Channels and User IDs
-# -----------------------------
-# Convert the comma-separated channels into a list
 TARGET_CHANNELS = [channel.strip() for channel in TARGET_CHANNELS.split(',') if channel.strip()]
 
-# Convert the comma-separated user IDs into a list of integers
-try:
-    NOTIFY_USER_IDS = [int(uid.strip()) for uid in NOTIFY_USER_IDS.split(',') if uid.strip()]
-except ValueError:
-    logger.error("❌ Error: One or more USER IDs in NOTIFY_USER_IDS are not valid integers.")
-    exit(1)
+# -----------------------------
+# 3. SQLite Database Setup
+# -----------------------------
+DB_FILE = "subscribers.db"
+
+def init_db():
+    """
+    Creates the necessary table (if it doesn't exist) 
+    to store subscribed user IDs.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # We'll store user IDs as integers, primary key to avoid duplicates
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS subscribed_users (
+            user_id INTEGER PRIMARY KEY
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def add_subscribed_user(user_id):
+    """
+    Inserts the user ID into the subscribed_users table 
+    (if it's not already there).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # INSERT OR IGNORE will not fail if there's a duplicate
+    cursor.execute("INSERT OR IGNORE INTO subscribed_users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def is_user_subscribed(user_id):
+    """
+    Checks if a user ID is already in the subscribed_users table.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM subscribed_users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def get_all_subscribed_users():
+    """
+    Retrieves all user IDs from the subscribed_users table.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM subscribed_users")
+    rows = cursor.fetchall()
+    conn.close()
+    # Return as a list of integers
+    return [row[0] for row in rows]
+
+# Initialize the SQLite database/table
+init_db()
 
 # -----------------------------
-# 5. Define "Call" Message Filtering Criteria
+# 4. Define "Call" Message Filtering Criteria
 # -----------------------------
-# Define regex pattern: starts with XAUUSD and contains BUY or Sell (case-insensitive)
+# Regex pattern: starts with XAUUSD and contains BUY or Sell (case-insensitive)
 CALL_PATTERN = re.compile(r'^XAUUSD.*\b(BUY|Sell)\b', re.IGNORECASE)
 
 # -----------------------------
-# 6. Initialize Telegram Clients
+# 5. Initialize Telegram Clients
 # -----------------------------
-# Name of the session files (placed inside sessions/ directory)
+os.makedirs("sessions", exist_ok=True)
 USER_SESSION = os.path.join("sessions", "telegram_monitor_text_only_user_session")
 BOT_SESSION = os.path.join("sessions", "telegram_monitor_text_only_bot_session")
 
-# Ensure the sessions directory exists
-os.makedirs("sessions", exist_ok=True)
-
-# Initialize the Telegram clients without starting them
 user_client = TelegramClient(USER_SESSION, int(API_ID), API_HASH)
 bot_client = TelegramClient(BOT_SESSION, int(API_ID), API_HASH)
 
 # -----------------------------
-# 7. Helper Function to Get Channel Display Name
+# 6. Helper Functions
 # -----------------------------
 def get_channel_display_name(event):
     """
@@ -114,18 +146,12 @@ def get_channel_display_name(event):
         logger.error(f"❌ Error retrieving channel display name: {e}")
         return "Unknown Channel"
 
-# -----------------------------
-# 8. Define Function to Escape HTML
-# -----------------------------
 def escape_html(text):
     """
     Escapes HTML special characters in the text.
     """
     return html.escape(text)
 
-# -----------------------------
-# 9. Gold API Fetch Function
-# -----------------------------
 def fetch_xauusd_price():
     """
     Fetches the live price of XAUUSD (gold vs USD) using the Gold API.
@@ -142,7 +168,6 @@ def fetch_xauusd_price():
         response = requests.get(url, headers=headers)
         response.raise_for_status()
 
-        # Parse the JSON response
         data = response.json()
         price = data.get("price")
         if price is not None:
@@ -156,7 +181,7 @@ def fetch_xauusd_price():
         return None
 
 # -----------------------------
-# 10. Define the Main Asynchronous Function
+# 7. Main Asynchronous Function
 # -----------------------------
 async def main():
     # Start the user client
@@ -179,6 +204,23 @@ async def main():
     logger.info("✅ Bot is running and monitoring **call** messages in the channels...")
 
     # -----------------------------
+    # Bot Command Handler: /start
+    # -----------------------------
+    @bot_client.on(events.NewMessage(pattern=r'^/start$'))
+    async def start_handler(event):
+        """
+        When a user sends /start, add them to the subscribed list and
+        confirm subscription.
+        """
+        user_id = event.sender_id
+        if not is_user_subscribed(user_id):
+            add_subscribed_user(user_id)
+            await event.respond("✅ You have been subscribed to gold signals.")
+            logger.info(f"User {user_id} subscribed via /start.")
+        else:
+            await event.respond("You are already subscribed to gold signals.")
+
+    # -----------------------------
     # Inline Button Callback Handler
     # -----------------------------
     @bot_client.on(events.CallbackQuery)
@@ -188,7 +230,6 @@ async def main():
         if data == "get_xauusd_price":
             price = fetch_xauusd_price()
             if price is not None:
-                # Respond with an alert message containing the price
                 await event.answer(
                     f"💰 Current XAUUSD Price: {price} USD",
                     alert=True
@@ -200,7 +241,7 @@ async def main():
                 )
 
     # -----------------------------
-    # Event Handler: Forward Matching Messages
+    # User Client: Forward Matching Messages
     # -----------------------------
     @user_client.on(events.NewMessage(chats=TARGET_CHANNELS))
     async def handler(event):
@@ -219,24 +260,26 @@ async def main():
         # Check if the message was forwarded in the channel
         is_forwarded = event.message.fwd_from is not None
 
-        # Escape HTML characters in the message text to prevent formatting issues
+        # Escape HTML characters in the message text
         escaped_message_text = escape_html(message_text)
 
         # Prepare the forwarded message with channel context
         channel_name = get_channel_display_name(event)
         forward_text = f"🔔 **New Call in {channel_name}:**\n\n{escaped_message_text}"
 
-        # Append forwarded information if applicable
         if is_forwarded:
             forward_text += "\n*This message was forwarded from another chat.*"
 
         # Inline button to fetch the price on demand
         buttons = [[Button.inline("Get XAUUSD Price", b"get_xauusd_price")]]
 
-        # -----------------------------
-        # Send the Forwarded Message via Bot (with button)
-        # -----------------------------
-        for user_id in NOTIFY_USER_IDS:
+        # Get all subscribed users from the database
+        subscribed_users = get_all_subscribed_users()
+        if not subscribed_users:
+            logger.info("No subscribed users to forward this call to.")
+            return
+
+        for user_id in subscribed_users:
             try:
                 await bot_client.send_message(
                     entity=user_id,
@@ -260,7 +303,7 @@ async def main():
     )
 
 # -----------------------------
-# 11. Run the Script
+# 8. Run the Script
 # -----------------------------
 if __name__ == '__main__':
     try:
