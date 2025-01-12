@@ -78,7 +78,6 @@ def add_subscribed_user(user_id):
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # INSERT OR IGNORE prevents duplicate errors
     cursor.execute("INSERT OR IGNORE INTO subscribed_users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
@@ -121,10 +120,8 @@ init_db()
 # -----------------------------
 # 4. Define "Call" Message Filtering Criteria
 # -----------------------------
-# Regex: starts with XAUUSD and contains BUY or Sell (case-insensitive)
 # Updated Regex: Matches "XAUUSD buy", "XAUUSD sell", or any message with "buy" or "sell" (case-insensitive)
-CALL_PATTERN = re.compile(r'(XAUUSD.*\b(?:buy|sell)\b|\b(?:buy|sell)\b)', re.IGNORECASE)
-
+CALL_PATTERN = re.compile(r'\b(XAUUSD.*(?:buy|sell)|(?:buy|sell))\b', re.IGNORECASE)
 
 # -----------------------------
 # 5. Initialize Telegram Clients
@@ -265,20 +262,17 @@ async def main():
             logger.info(f"📄 Skipped forwarding an empty or non-text message from {get_channel_display_name(event)}.")
             return
 
-        if not CALL_PATTERN.match(message_text):
-            logger.info(f"📄 Skipped forwarding a non-call message from {get_channel_display_name(event)}.")
+        if not CALL_PATTERN.search(message_text):
+            logger.info(f"📄 Skipped forwarding a non-call message from {get_channel_display_name(event)}: {message_text}")
             return
 
         is_forwarded = event.message.fwd_from is not None
         escaped_message_text = escape_html(message_text)
         channel_name = get_channel_display_name(event)
-        forward_text = f"🔔 **New Call in {channel_name}:**\n\n{escaped_message_text}"
+        forward_text = f"🔔 **New Signal in {channel_name}:**\n\n{escaped_message_text}"
         if is_forwarded:
             forward_text += "\n*This message was forwarded from another chat.*"
 
-        # Two inline buttons:
-        # 1) Get the XAUUSD price.
-        # 2) Unsubscribe from the bot.
         buttons = [
             [
                 Button.inline("Get XAUUSD Price", b"get_xauusd_price"),
@@ -288,7 +282,7 @@ async def main():
 
         subscribed_users = get_all_subscribed_users()
         if not subscribed_users:
-            logger.info("No subscribed users to forward this call to.")
+            logger.info("No subscribed users to forward this signal to.")
             return
 
         for user_id in subscribed_users:
@@ -298,15 +292,9 @@ async def main():
                     message=forward_text,
                     buttons=buttons
                 )
-                logger.info(f"📩 Forwarded call to user ID {user_id}: {message_text}")
-            except UsernameNotOccupiedError:
-                logger.error(f"❌ Failed to forward call to user ID {user_id}: Username not occupied.")
-            except PeerIdInvalidError:
-                logger.error(f"❌ Failed to forward call to user ID {user_id}: Invalid Peer ID.")
-            except RPCError as e:
-                logger.error(f"❌ Failed to forward call to user ID {user_id}: {e}")
+                logger.info(f"📩 Forwarded signal to user ID {user_id}: {message_text}")
             except Exception as e:
-                logger.error(f"❌ Unexpected error when forwarding to user ID {user_id}: {e}")
+                logger.error(f"❌ Error when forwarding to user ID {user_id}: {e}")
 
     # Keep both clients running until manually stopped
     await asyncio.gather(
