@@ -122,7 +122,9 @@ init_db()
 # 4. Define "Call" Message Filtering Criteria
 # -----------------------------
 # Regex: starts with XAUUSD and contains BUY or Sell (case-insensitive)
-CALL_PATTERN = re.compile(r'^XAUUSD.*\b(BUY|Sell)\b', re.IGNORECASE)
+# Updated Regex: Matches "XAUUSD buy", "XAUUSD sell", or any message with "buy" or "sell" (case-insensitive)
+CALL_PATTERN = re.compile(r'(XAUUSD.*\b(?:buy|sell)\b|\b(?:buy|sell)\b)', re.IGNORECASE)
+
 
 # -----------------------------
 # 5. Initialize Telegram Clients
