@@ -9,6 +9,7 @@ from telethon.errors import (
     UsernameNotOccupiedError,
     PeerIdInvalidError
 )
+from telethon.tl.types import Channel, User
 from dotenv import load_dotenv
 import re
 import html  # For escaping HTML characters
@@ -185,8 +186,88 @@ def fetch_xauusd_price():
         logger.error(f"❌ Error fetching XAUUSD price: {e}")
         return None
 
+async def build_forward_text(event, message_text, is_edit=False):
+    """
+    Builds the text that will be forwarded to subscribers, including:
+      - The channel display name where the message originated.
+      - If the message is forwarded from someone else, add "Forwarded from <Name>".
+      - If the message is an edit, indicates it was edited.
+    """
+    escaped_message_text = escape_html(message_text)
+    channel_name = get_channel_display_name(event)
+    forward_text = ""
+
+    if is_edit:
+        forward_text += f"🔄 **Edited Signal in {channel_name}:**\n\n{escaped_message_text}"
+    else:
+        forward_text += f"🔔 **New Signal in {channel_name}:**\n\n{escaped_message_text}"
+
+    # If the message was forwarded, determine the original sender/channel if possible.
+    fwd_info = event.message.fwd_from
+    if fwd_info:
+        # Try to resolve the name of the original forward source
+        fwd_name = None
+        if fwd_info.from_name:
+            # If the forward info has a textual name only
+            fwd_name = fwd_info.from_name
+        elif fwd_info.from_id:
+            try:
+                from_entity = await user_client.get_entity(fwd_info.from_id)
+                if isinstance(from_entity, Channel):
+                    fwd_name = from_entity.title or "Unknown Channel"
+                elif isinstance(from_entity, User):
+                    # Could be a user; prefer first_name, fallback to username
+                    if from_entity.first_name:
+                        fwd_name = from_entity.first_name
+                        if from_entity.last_name:
+                            fwd_name += " " + from_entity.last_name
+                    else:
+                        fwd_name = "Unknown User"
+            except Exception:
+                fwd_name = "Unknown"
+
+        if not fwd_name:
+            # If we couldn't fetch from_name or entity
+            fwd_name = "Unknown"
+
+        forward_text += f"\n\n*Forwarded from {escape_html(fwd_name)}.*"
+
+    return forward_text
+
+async def forward_to_subscribers(bot_client, forward_text):
+    """
+    Forwards the given text (with inline buttons) to all subscribed users.
+    """
+    buttons = [
+        [
+            Button.inline("Get XAUUSD Price", b"get_xauusd_price"),
+            Button.inline("Unsubscribe", b"unsubscribe_me")
+        ]
+    ]
+
+    subscribed_users = get_all_subscribed_users()
+    if not subscribed_users:
+        logger.info("No subscribed users to forward this signal to.")
+        return
+
+    for user_id in subscribed_users:
+        try:
+            await bot_client.send_message(
+                entity=user_id,
+                message=forward_text,
+                buttons=buttons
+            )
+            logger.info(f"📩 Forwarded signal to user ID {user_id}")
+        except Exception as e:
+            logger.error(f"❌ Error when forwarding to user ID {user_id}: {e}")
+
 # -----------------------------
-# 7. Main Async Function
+# 7. Keep Track of Original "Call" Text to Detect Real Edits
+# -----------------------------
+matched_call_texts = {}  # key: (chat_id, msg_id), value: original message text
+
+# -----------------------------
+# 8. Main Async Function
 # -----------------------------
 async def main():
     # Start the user client
@@ -253,10 +334,10 @@ async def main():
                 await event.answer("You are not currently subscribed.", alert=True)
 
     # -----------------------------
-    # User Client: Forward Matching Messages
+    # User Client: Forward Matching Messages (New)
     # -----------------------------
     @user_client.on(events.NewMessage(chats=TARGET_CHANNELS))
-    async def handler(event):
+    async def on_new_message(event):
         message_text = event.message.message or ""
         if not message_text.strip():
             logger.info(f"📄 Skipped forwarding an empty or non-text message from {get_channel_display_name(event)}.")
@@ -266,35 +347,48 @@ async def main():
             logger.info(f"📄 Skipped forwarding a non-call message from {get_channel_display_name(event)}: {message_text}")
             return
 
-        is_forwarded = event.message.fwd_from is not None
-        escaped_message_text = escape_html(message_text)
-        channel_name = get_channel_display_name(event)
-        forward_text = f"🔔 **New Signal in {channel_name}:**\n\n{escaped_message_text}"
-        if is_forwarded:
-            forward_text += "\n*This message was forwarded from another chat.*"
+        # Store the message text in matched_call_texts for comparison on edits
+        matched_call_texts[(event.chat_id, event.message.id)] = message_text
 
-        buttons = [
-            [
-                Button.inline("Get XAUUSD Price", b"get_xauusd_price"),
-                Button.inline("Unsubscribe", b"unsubscribe_me")
-            ]
-        ]
+        # Build forward text
+        forward_text = await build_forward_text(event, message_text, is_edit=False)
+        # Forward to subscribers
+        await forward_to_subscribers(bot_client, forward_text)
 
-        subscribed_users = get_all_subscribed_users()
-        if not subscribed_users:
-            logger.info("No subscribed users to forward this signal to.")
+        logger.info(f"📩 Forwarded signal to all subscribers: {message_text}")
+
+    # -----------------------------
+    # Handle Edited Messages
+    # -----------------------------
+    @user_client.on(events.MessageEdited(chats=TARGET_CHANNELS))
+    async def on_edited_message(event):
+        """
+        Forward only if:
+          - It was previously a matched 'call' (exists in matched_call_texts)
+          - The text has actually changed
+        """
+        key = (event.chat_id, event.message.id)
+        if key not in matched_call_texts:
+            # Not a matched call to begin with, ignore
             return
 
-        for user_id in subscribed_users:
-            try:
-                await bot_client.send_message(
-                    entity=user_id,
-                    message=forward_text,
-                    buttons=buttons
-                )
-                logger.info(f"📩 Forwarded signal to user ID {user_id}: {message_text}")
-            except Exception as e:
-                logger.error(f"❌ Error when forwarding to user ID {user_id}: {e}")
+        old_text = matched_call_texts[key]
+        new_text = event.message.message or ""
+
+        # Check if the text has actually changed
+        if new_text.strip() == old_text.strip():
+            logger.info(f"✏️ Ignored an edit where the text didn't change: {new_text}")
+            return
+
+        # Update the stored text so future edits compare against the new text
+        matched_call_texts[key] = new_text
+
+        # Build the forward text indicating it's an edit
+        forward_text = await build_forward_text(event, new_text, is_edit=True)
+        # Forward to subscribers
+        await forward_to_subscribers(bot_client, forward_text)
+
+        logger.info(f"✏️ Forwarded edited signal to all subscribers: {new_text}")
 
     # Keep both clients running until manually stopped
     await asyncio.gather(
@@ -303,7 +397,7 @@ async def main():
     )
 
 # -----------------------------
-# 8. Run the Script
+# 9. Run the Script
 # -----------------------------
 if __name__ == '__main__':
     try:
